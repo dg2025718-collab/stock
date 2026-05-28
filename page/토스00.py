@@ -21,7 +21,7 @@ today = datetime.date.today()
 start_date = st.sidebar.date_input("시작일", today - datetime.timedelta(days=365))
 end_date = st.sidebar.date_input("종료일", today)
 
-# 비교할 주식 리스트 (토스증권 인기 종목 기준 예시)
+# 비교할 주식 리스트
 ticker_dict = {
     "삼성전자": "005930.KS",
     "SK하이닉스": "000660.KS",
@@ -34,7 +34,7 @@ ticker_dict = {
     "Microsoft (MSFT)": "MSFT"
 }
 
-# 사용자 종목 선택 (다중 선택 가능)
+# 사용자 종목 선택
 selected_names = st.sidebar.multiselect(
     "비교할 종목을 선택하세요 (여러 개 가능)",
     options=list(ticker_dict.keys()),
@@ -52,60 +52,80 @@ if custom_ticker:
 if selected_names:
     selected_tickers = [ticker_dict[name] for name in selected_names]
     
-    @st.cache_data(ttl=3600)  # 1시간 동안 데이터 캐싱하여 속도 향상
+    @st.cache_data(ttl=3600)
     def load_data(tickers, start, end):
-        data = yf.download(tickers, start=start, end=end)['Adj Close']
-        # 단일 종목 선택 시 Series가 반환되므로 DataFrame으로 변환
-        if isinstance(data, pd.Series):
-            data = data.to_frame(name=tickers[0])
-        return data
+        # 1. 안전하게 'Close' 또는 'Adj Close'를 명시해서 다운로드하거나 전체를 받은 뒤 추출합니다.
+        # yfinance 최신 구조 대응을 위해 group_by='ticker' 옵션을 사용하면 다루기 더 쉽습니다.
+        raw_data = yf.download(tickers, start=start, end=end, group_by='ticker')
+        
+        df_close = pd.DataFrame()
+        
+        # 단일 종목일 때와 다중 종목일 때 데이터 구조 분기 처리
+        if len(tickers) == 1:
+            ticker = tickers[0]
+            # 단일 종목은 상위 멀티인덱스가 없을 수 있으므로 체크 후 가져옴
+            if 'Adj Close' in raw_data.columns:
+                df_close[ticker] = raw_data['Adj Close']
+            else:
+                df_close[ticker] = raw_data['Close']
+        else:
+            # 다중 종목일 경우 각 티커별로 'Adj Close' 또는 'Close' 추출
+            for ticker in tickers:
+                if ticker in raw_data.columns.levels[0]:
+                    if 'Adj Close' in raw_data[ticker].columns:
+                        df_close[ticker] = raw_data[ticker]['Adj Close']
+                    else:
+                        df_close[ticker] = raw_data[ticker]['Close']
+                        
+        return df_close
 
     try:
         df_close = load_data(selected_tickers, start_date, end_date)
         
-        # 이름 변경 (티커 -> 한글/영문 이름)
-        inv_ticker_dict = {v: k for k, v in ticker_dict.items()}
-        df_close = df_close.rename(columns=inv_ticker_dict)
+        if df_close.empty:
+            st.error("선택한 기간에 데이터가 존재하지 않습니다. 날짜를 다시 조정해 주세요.")
+        else:
+            # 이름 변경 (티커 -> 한글/영문 이름)
+            inv_ticker_dict = {v: k for k, v in ticker_dict.items()}
+            df_close = df_close.rename(columns=inv_ticker_dict)
 
-        # 결측치 처리
-        df_close = df_close.ffill().bfill()
+            # 결측치 처리 (주말/휴일 등으로 인한 빈칸 채우기)
+            df_close = df_close.ffill().bfill()
 
-        # 누적 수익률 계산 (시작 시점 대비 변화율)
-        df_return = (df_close / df_close.iloc[0] - 1) * 100
+            # 누적 수익률 계산 (첫날 종가 대비 % 변화율)
+            df_return = (df_close / df_close.iloc[0] - 1) * 100
 
-        # --- 메인 화면 레이아웃 ---
-        
-        # 1. 최신 수익률 요약 메트릭
-        st.subheader("📊 종목별 누적 수익률 요약")
-        cols = st.columns(len(selected_names))
-        
-        for i, name in enumerate(selected_names):
-            if name in df_return.columns:
-                current_return = df_return[name].iloc[-1]
-                current_price = df_close[name].iloc[-1]
-                
-                # 토스 감성의 컬러 적용 (+는 빨강/주황, -는 파랑)
-                color_arrow = "🔺" if current_return >= 0 else "🔻"
-                
-                cols[i].metric(
-                    label=name,
-                    value=f"{current_price:,.2f}" if current_price > 100 else f"${current_price:,.2f}",
-                    delta=f"{color_arrow} {current_return:.2f}%"
-                )
+            # --- 메인 화면 레이아웃 ---
+            
+            # 1. 최신 수익률 요약 메트릭
+            st.subheader("📊 종목별 누적 수익률 요약")
+            cols = st.columns(len(selected_names))
+            
+            for i, name in enumerate(selected_names):
+                if name in df_return.columns:
+                    current_return = df_return[name].iloc[-1]
+                    current_price = df_close[name].iloc[-1]
+                    
+                    color_arrow = "🔺" if current_return >= 0 else "🔻"
+                    
+                    cols[i].metric(
+                        label=name,
+                        value=f"{current_price:,.2f}" if current_price > 100 else f"${current_price:,.2f}",
+                        delta=f"{color_arrow} {current_return:.2f}%"
+                    )
 
-        st.markdown("---")
+            st.markdown("---")
 
-        # 2. 누적 수익률 차트
-        st.subheader("📈 기간 내 누적 수익률 추이 (%)")
-        st.line_chart(df_return)
+            # 2. 누적 수익률 차트
+            st.subheader("📈 기간 내 누적 수익률 추이 (%)")
+            st.line_chart(df_return)
 
-        # 3. 데이터 상세 보기
-        st.markdown("---")
-        with st.expander("📄 주가 데이터 원본 보기"):
-            st.dataframe(df_close, use_container_width=True)
+            # 3. 데이터 상세 보기
+            st.markdown("---")
+            with st.expander("📄 주가 데이터 원본 보기"):
+                st.dataframe(df_close, use_container_width=True)
 
     except Exception as e:
-        st.error(f"데이터를 불러오는 중 오류가 발생했습니다: {e}")
-        st.info("티커 심볼이 올바른지, 혹은 선택한 기간에 데이터가 존재하는지 확인해 주세요.")
+        st.error(f"데이터 처리 중 오류가 발생했습니다: {e}")
 else:
     st.info("왼쪽 사이드바에서 비교할 종목을 선택해 주세요!")
